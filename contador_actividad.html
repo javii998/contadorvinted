@@ -232,9 +232,9 @@
       <span>📱</span>
       <span>Sync: <span id="st-sync-tag" class="tag purple">—</span></span>
     </div>
-    <div class="status-item">
-      <span>🔥</span>
-      <span id="firebase-status" class="tag" style="display:none;"></span>
+    <div class="status-item" id="st-cloud-item">
+      <span>☁️</span>
+      <span id="cloud-status" class="tag">Conectando…</span>
     </div>
   </div>
 
@@ -370,7 +370,7 @@
   <div class="modal">
     <button class="modal-close" onclick="closeSync()">×</button>
     <h2>📱 Sincronización móvil</h2>
-    <p>Con Firebase activo, los datos se sincronizan en tiempo real entre todos tus dispositivos automáticamente. Sin Firebase, usa el QR + exportar/importar.</p>
+    <p>Los datos se sincronizan en la nube automáticamente. Abre la misma URL en cualquier dispositivo y los cambios se reflejan al instante.</p>
     <div class="qr-wrap">
       <canvas id="qr-canvas" width="180" height="180"></canvas>
       <div class="qr-url" id="qr-url-text"></div>
@@ -387,27 +387,14 @@
   </div>
 </div>
 
-
-<!-- Firebase SDK -->
-<script type="module">
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
-import { getDatabase, ref, onValue, set, serverTimestamp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js';
-
+<script>
 // ══════════════════════════════════════════════
-// 🔥 CONFIGURACIÓN FIREBASE
-// Reemplaza estos valores con los de tu proyecto
-// (ver README.md para instrucciones)
+// ☁️  JSONBIN — sincronización en la nube
 // ══════════════════════════════════════════════
-const FIREBASE_CONFIG = {
-  apiKey:            "TU_API_KEY",
-  authDomain:        "TU_PROYECTO.firebaseapp.com",
-  databaseURL:       "https://TU_PROYECTO-default-rtdb.europe-west1.firebasedatabase.app",
-  projectId:         "TU_PROYECTO",
-  storageBucket:     "TU_PROYECTO.appspot.com",
-  messagingSenderId: "TU_SENDER_ID",
-  appId:             "TU_APP_ID"
-};
-// ══════════════════════════════════════════════
+const JSONBIN_ID  = '69d8a441856a6821891a4c85';
+const JSONBIN_KEY = '$2a$10$3V9PKSgXUKwzfHizWC0BYe3Zp/ozrEfs2f7DvzaPYXghZ1I3O8hT6';
+const JSONBIN_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_ID}`;
+const POLL_MS     = 8000; // refresca cada 8 segundos
 
 // ── QR ────────────────────────────────────────
 function drawQR(url) {
@@ -426,15 +413,13 @@ function drawQR(url) {
     ctx.fillStyle = '#F1EFE8'; ctx.fillRect(0,0,size,size);
     ctx.fillStyle = '#BA7517'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
     ctx.fillText('Abre la URL en tu móvil', size/2, size/2-8);
-    ctx.fillText('(QR requiere conexión)', size/2, size/2+10);
   };
   img.src = 'https://chart.googleapis.com/chart?chs=180x180&cht=qr&chl='+encodeURIComponent(url)+'&choe=UTF-8';
 }
 
 // ── Constants ─────────────────────────────────
 const STORAGE_KEY = 'contador_actividad_v3';
-const DB_PATH     = 'contador/data';
-const MESES_ES    = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const MESES_ES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
 
 const CSV_SEED = [
   {type:'ing', name:'LI J',                   amt:10.00,  month:'2026-04'},
@@ -491,98 +476,121 @@ let chartMonth  = null;
 let activeTab   = 'general';
 let openMonths  = {};
 let pedFilter   = 'all';
+let lastRemoteHash = '';
+let isSaving    = false;
+let pollTimer   = null;
 
-// Firebase state
-let db            = null;
-let firebaseOK    = false;
-let ignoreNext    = false; // evitar eco al guardar
-
-// ── Firebase init ─────────────────────────────
-function isFirebaseConfigured() {
-  return FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey !== 'TU_API_KEY';
-}
-
-function initFirebase() {
-  if (!isFirebaseConfigured()) {
-    setSyncIndicator('local', '⚠️ Firebase no configurado');
-    return;
-  }
-  try {
-    const app = initializeApp(FIREBASE_CONFIG);
-    db = getDatabase(app);
-    setSyncIndicator('connecting', '🔄 Conectando…');
-
-    const dataRef = ref(db, DB_PATH);
-    onValue(dataRef, (snapshot) => {
-      const remote = snapshot.val();
-      if (!remote) {
-        // Primera vez: subir datos locales
-        pushToFirebase();
-        setSyncIndicator('ok', '☁️ Sincronizado');
-        return;
-      }
-      if (ignoreNext) { ignoreNext = false; setSyncIndicator('ok', '☁️ Sincronizado'); return; }
-
-      // Recibir datos remotos
-      entries     = remote.entries  || { ing:[], gas:[] };
-      pedidos     = remote.pedidos  || [];
-      stock       = remote.stock    || [];
-      lastUpdated = remote.lastUpdated ? new Date(remote.lastUpdated) : null;
-      lastAdded   = remote.lastAdded   || null;
-
-      saveLocal();
-      refreshStatus();
-      renderAll();
-      firebaseOK = true;
-      setSyncIndicator('ok', '☁️ Sincronizado · ' + new Date().toLocaleTimeString('es-ES', {hour:'2-digit',minute:'2-digit'}));
-    }, (error) => {
-      console.error('Firebase error:', error);
-      setSyncIndicator('error', '❌ Error de conexión');
-    });
-  } catch(e) {
-    console.error('Firebase init error:', e);
-    setSyncIndicator('error', '❌ Config incorrecta');
-  }
-}
-
-function pushToFirebase() {
-  if (!db) return;
-  ignoreNext = true;
-  set(ref(db, DB_PATH), {
-    entries, pedidos, stock,
-    lastUpdated: lastUpdated ? lastUpdated.toISOString() : null,
-    lastAdded
-  }).catch(e => {
-    console.error('Firebase write error:', e);
-    setSyncIndicator('error', '❌ Error al guardar');
-    ignoreNext = false;
-  });
-}
-
-function setSyncIndicator(state, text) {
-  const el = document.getElementById('firebase-status');
+// ── Cloud status UI ───────────────────────────
+function setCloud(state, text) {
+  const el = document.getElementById('cloud-status');
   if (!el) return;
-  const colors = { ok: 'var(--green-dark)', connecting: '#185FA5', error: 'var(--red-dark)', local: 'var(--amber)' };
-  const bgs    = { ok: 'var(--green-light)', connecting: 'var(--blue-light)', error: 'var(--red-light)', local: 'var(--amber-light)' };
+  const styles = {
+    ok:      { bg: 'var(--green-light)',  color: 'var(--green-dark)' },
+    saving:  { bg: 'var(--blue-light)',   color: '#185FA5' },
+    error:   { bg: 'var(--red-light)',    color: 'var(--red-dark)' },
+    loading: { bg: 'var(--amber-light)',  color: 'var(--amber)' },
+  };
+  const s = styles[state] || {};
   el.textContent = text;
-  el.style.color = colors[state] || 'var(--text-muted)';
-  el.style.background = bgs[state] || 'var(--surface2)';
-  el.style.display = '';
+  el.style.background = s.bg || '';
+  el.style.color = s.color || '';
+  document.getElementById('status-bar').style.display = 'flex';
 }
 
-// ── Persistence (local fallback) ──────────────
+// ── JSONBin API ───────────────────────────────
+function dataHash(d) {
+  return JSON.stringify({ entries: d.entries, pedidos: d.pedidos, stock: d.stock });
+}
+
+async function cloudLoad() {
+  try {
+    const res = await fetch(JSONBIN_URL + '/latest', {
+      headers: { 'X-Master-Key': JSONBIN_KEY }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    return json.record || null;
+  } catch(e) {
+    console.error('cloudLoad error:', e);
+    return null;
+  }
+}
+
+async function cloudSave(data) {
+  try {
+    const res = await fetch(JSONBIN_URL, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Master-Key': JSONBIN_KEY
+      },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return true;
+  } catch(e) {
+    console.error('cloudSave error:', e);
+    return false;
+  }
+}
+
+// ── Sync logic ────────────────────────────────
+async function syncFromCloud(showStatus = false) {
+  if (showStatus) setCloud('loading', '🔄 Sincronizando…');
+  const remote = await cloudLoad();
+  if (!remote) {
+    setCloud('error', '❌ Sin conexión');
+    return false;
+  }
+  const hash = dataHash(remote);
+  if (hash === lastRemoteHash) {
+    setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+    return false; // no hay cambios
+  }
+  // Hay datos nuevos remotos
+  lastRemoteHash = hash;
+  entries     = remote.entries  || { ing:[], gas:[] };
+  pedidos     = remote.pedidos  || [];
+  stock       = remote.stock    || [];
+  lastUpdated = remote.lastUpdated ? new Date(remote.lastUpdated) : null;
+  lastAdded   = remote.lastAdded   || null;
+  saveLocal();
+  refreshStatus();
+  renderAll();
+  setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  return true;
+}
+
+async function syncToCloud() {
+  if (isSaving) return;
+  isSaving = true;
+  setCloud('saving', '💾 Guardando…');
+  const data = { entries, pedidos, stock, lastUpdated: lastUpdated?.toISOString(), lastAdded };
+  const ok = await cloudSave(data);
+  lastRemoteHash = dataHash(data);
+  isSaving = false;
+  if (ok) {
+    setCloud('ok', '☁️ Guardado · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  } else {
+    setCloud('error', '❌ Error al guardar');
+  }
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    if (!isSaving) await syncFromCloud();
+  }, POLL_MS);
+}
+
+// ── Persistence ───────────────────────────────
 function saveLocal() {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ entries, pedidos, stock, lastUpdated: lastUpdated?.toISOString(), lastAdded })); } catch(e){}
 }
 
 function save() {
   saveLocal();
-  if (firebaseOK || (db && isFirebaseConfigured())) {
-    pushToFirebase();
-  } else {
-    // fallback: cross-tab via storage event
-    try { localStorage.setItem(STORAGE_KEY+'_ping', Date.now().toString()); } catch(e){}
-  }
+  syncToCloud();
 }
 
 function loadLocal() {
@@ -608,13 +616,6 @@ function seedFromCSV() {
   lastAdded   = { type: 'ing', name: 'dan suscrpción atw', amt: 40.00 };
   save();
 }
-
-// Cross-tab fallback (sin Firebase)
-window.addEventListener('storage', e => {
-  if (e.key === STORAGE_KEY+'_ping' && !firebaseOK) {
-    loadLocal(); renderAll();
-  }
-});
 
 // ── Helpers ───────────────────────────────────
 function fmt(n) { return '€' + n.toLocaleString('es-ES', { minimumFractionDigits:2, maximumFractionDigits:2 }); }
@@ -648,7 +649,6 @@ function switchTab(tab) {
   if (tab==='pedidos') renderPedidos();
   if (tab==='stock')   renderStock();
 }
-window.switchTab = switchTab;
 
 // ── Status bar ────────────────────────────────
 function refreshStatus() {
@@ -678,14 +678,12 @@ function addEntry(type) {
   render();
   if (activeTab==='meses') renderMonths();
 }
-window.addEntry = addEntry;
 
 function removeEntry(type, id) {
   entries[type] = entries[type].filter(e => e.id!==id);
   lastUpdated=new Date(); save(); refreshStatus(); render();
   if (activeTab==='meses') renderMonths();
 }
-window.removeEntry = removeEntry;
 
 // ── General render ────────────────────────────
 function render() {
@@ -743,8 +741,6 @@ function toggleMonth(m){
   if(body)body.classList.toggle('open',!!openMonths[m]);
   if(toggle)toggle.classList.toggle('open',!!openMonths[m]);
 }
-window.toggleMonth=toggleMonth;
-
 function renderMonths(){
   const monthData=getMonthlyData(),container=document.getElementById('month-list');
   if(!monthData.length){container.innerHTML='<div class="empty" style="padding:2rem 0;">Sin datos por mes todavía</div>';updateMonthChart([]);return;}
@@ -782,7 +778,6 @@ function renderMonths(){
   }).join('');
   updateMonthChart(monthData);
 }
-
 function updateMonthChart(monthData){
   const sorted=[...monthData].sort((a,b)=>a[0].localeCompare(b[0]));
   const labels=sorted.map(([m])=>monthLabel(m));
@@ -815,30 +810,20 @@ function addPedido(){
   itemEl.value='';buyerEl.value='';descEl.value='';
   renderPedidos();
 }
-window.addPedido=addPedido;
-
 function togglePedidoStatus(id){
   const p=pedidos.find(x=>x.id===id);if(!p)return;
   p.status=p.status==='pendiente'?'enviado':'pendiente';
   lastUpdated=new Date();save();refreshStatus();renderPedidos();
 }
-window.togglePedidoStatus=togglePedidoStatus;
-
 function deletePedido(id){
   pedidos=pedidos.filter(x=>x.id!==id);
   lastUpdated=new Date();save();refreshStatus();renderPedidos();
 }
-window.deletePedido=deletePedido;
-
 function setPedFilter(f){
   pedFilter=f;
-  ['all','pendiente','enviado'].forEach(k=>{
-    document.getElementById('pf-'+k).classList.toggle('active-filter',k===f);
-  });
+  ['all','pendiente','enviado'].forEach(k=>document.getElementById('pf-'+k).classList.toggle('active-filter',k===f));
   renderPedidos();
 }
-window.setPedFilter=setPedFilter;
-
 function renderPedidos(){
   const pend=pedidos.filter(p=>p.status==='pendiente').length,env=pedidos.filter(p=>p.status==='enviado').length;
   document.getElementById('m-ped-pend').textContent=pend;
@@ -857,7 +842,7 @@ function renderPedidos(){
         </div>
         <div class="pedido-meta">
           <span class="pedido-date">${fmtShort(p.createdAt)}</span>
-          <span class="status-pill ${escHtml(p.status)}" onclick="togglePedidoStatus(${p.id})" title="Toca para cambiar estado">
+          <span class="status-pill ${escHtml(p.status)}" onclick="togglePedidoStatus(${p.id})">
             ${p.status==='pendiente'?'⏳ Pendiente':'✅ Enviado'}
           </span>
         </div>
@@ -883,21 +868,15 @@ function addStockItem(){
   nameEl.value='';qtyEl.value='';priceEl.value='';nameEl.focus();
   renderStock();
 }
-window.addStockItem=addStockItem;
-
 function changeQty(id,delta){
   const item=stock.find(s=>s.id===id);if(!item)return;
   item.qty=Math.max(0,item.qty+delta);
   lastUpdated=new Date();save();refreshStatus();renderStock();
 }
-window.changeQty=changeQty;
-
 function deleteStockItem(id){
   stock=stock.filter(s=>s.id!==id);
   lastUpdated=new Date();save();refreshStatus();renderStock();
 }
-window.deleteStockItem=deleteStockItem;
-
 function renderStock(){
   const total=stock.reduce((s,i)=>s+i.qty,0),lowCount=stock.filter(i=>i.qty>0&&i.qty<=3).length;
   document.getElementById('m-sk-items').textContent=stock.length;
@@ -930,14 +909,8 @@ function openSync(){
   document.getElementById('qr-url-text').textContent=url;
   drawQR(url);
 }
-window.openSync=openSync;
-
 function closeSync(){ document.getElementById('sync-modal').style.display='none'; }
-window.closeSync=closeSync;
-
 function closeSyncIfOutside(e){ if(e.target===document.getElementById('sync-modal')) closeSync(); }
-window.closeSyncIfOutside=closeSyncIfOutside;
-
 function exportDataString(){
   try{
     const payload=btoa(unescape(encodeURIComponent(JSON.stringify({entries,pedidos,stock,exportedAt:new Date().toISOString()}))));
@@ -945,8 +918,6 @@ function exportDataString(){
     showSyncMsg('Código generado. Cópialo y pégalo en el otro dispositivo.','info');
   }catch(e){showSyncMsg('Error al generar el código.','err');}
 }
-window.exportDataString=exportDataString;
-
 function importData(){
   const raw=document.getElementById('sync-text').value.trim();
   if(!raw){showSyncMsg('Pega primero el código de sincronización.','err');return;}
@@ -955,11 +926,9 @@ function importData(){
     if(!d.entries)throw new Error('Formato inválido');
     entries=d.entries||{ing:[],gas:[]};pedidos=d.pedidos||[];stock=d.stock||[];
     lastUpdated=new Date();save();refreshStatus();renderAll();
-    showSyncMsg('✅ Datos importados correctamente.','ok');
+    showSyncMsg('✅ Datos importados y guardados en la nube.','ok');
   }catch(e){showSyncMsg('❌ Código inválido. Asegúrate de copiarlo completo.','err');}
 }
-window.importData=importData;
-
 function showSyncMsg(msg,type){
   const el=document.getElementById('sync-status');
   el.textContent=msg;el.className='sync-status '+type;el.style.display='';
@@ -990,17 +959,19 @@ function exportCSV(){
   const a=document.createElement('a');a.href=url;a.download='contador_actividad_'+new Date().toISOString().slice(0,10)+'.csv';a.click();
   URL.revokeObjectURL(url);
 }
-window.exportCSV=exportCSV;
 
 // ── Init ──────────────────────────────────────
-const hasData=loadLocal();
-if(!hasData) seedFromCSV();
-document.getElementById('ing-month').value=currentMonth();
-document.getElementById('gas-month').value=currentMonth();
+const hasData = loadLocal();
+if (!hasData) seedFromCSV();
+document.getElementById('ing-month').value = currentMonth();
+document.getElementById('gas-month').value = currentMonth();
 refreshStatus();
 render();
 setPedFilter('all');
-initFirebase();
+
+// Carga inicial desde la nube y arranca el polling
+setCloud('loading', '🔄 Conectando…');
+syncFromCloud(true).then(() => startPolling());
 
 document.getElementById('ing-name').addEventListener('keydown',e=>e.key==='Enter'&&document.getElementById('ing-amt').focus());
 document.getElementById('ing-amt').addEventListener('keydown', e=>e.key==='Enter'&&addEntry('ing'));
@@ -1009,7 +980,6 @@ document.getElementById('gas-amt').addEventListener('keydown', e=>e.key==='Enter
 document.getElementById('ped-item').addEventListener('keydown',e=>e.key==='Enter'&&document.getElementById('ped-buyer').focus());
 document.getElementById('sk-name').addEventListener('keydown', e=>e.key==='Enter'&&document.getElementById('sk-qty').focus());
 document.getElementById('sk-qty').addEventListener('keydown',  e=>e.key==='Enter'&&addStockItem());
-
 </script>
 </body>
 </html>
