@@ -476,9 +476,11 @@ let chartMonth  = null;
 let activeTab   = 'general';
 let openMonths  = {};
 let pedFilter   = 'all';
-let lastRemoteHash = '';
-let isSaving    = false;
-let pollTimer   = null;
+let lastRemoteTs = 0;   // timestamp de los datos que hay en la nube
+let isSaving     = false;
+let saveQueued   = false;
+let pollTimer    = null;
+let appReady     = false; // true solo después de la carga inicial
 
 // ── Cloud status UI ───────────────────────────
 function setCloud(state, text) {
@@ -498,10 +500,6 @@ function setCloud(state, text) {
 }
 
 // ── JSONBin API ───────────────────────────────
-function dataHash(d) {
-  return JSON.stringify({ entries: d.entries, pedidos: d.pedidos, stock: d.stock });
-}
-
 async function cloudLoad() {
   try {
     const res = await fetch(JSONBIN_URL + '/latest', {
@@ -511,7 +509,7 @@ async function cloudLoad() {
     const json = await res.json();
     return json.record || null;
   } catch(e) {
-    console.error('cloudLoad error:', e);
+    console.error('cloudLoad:', e);
     return null;
   }
 }
@@ -520,101 +518,179 @@ async function cloudSave(data) {
   try {
     const res = await fetch(JSONBIN_URL, {
       method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Master-Key': JSONBIN_KEY
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
       body: JSON.stringify(data)
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     return true;
   } catch(e) {
-    console.error('cloudSave error:', e);
+    console.error('cloudSave:', e);
     return false;
   }
 }
 
-// ── Sync logic ────────────────────────────────
-async function syncFromCloud(showStatus = false) {
-  if (showStatus) setCloud('loading', '🔄 Sincronizando…');
-  const remote = await cloudLoad();
-  if (!remote) {
-    setCloud('error', '❌ Sin conexión');
-    return false;
-  }
-  const hash = dataHash(remote);
-  if (hash === lastRemoteHash) {
-    setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
-    return false; // no hay cambios
-  }
-  // Hay datos nuevos remotos
-  lastRemoteHash = hash;
-  entries     = remote.entries  || { ing:[], gas:[] };
-  pedidos     = remote.pedidos  || [];
-  stock       = remote.stock    || [];
-  lastUpdated = remote.lastUpdated ? new Date(remote.lastUpdated) : null;
-  lastAdded   = remote.lastAdded   || null;
-  saveLocal();
-  refreshStatus();
-  renderAll();
-  setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
-  return true;
+// ── Helpers ───────────────────────────────────
+function dataTs(d) {
+  // Devuelve el timestamp numérico de un objeto de datos, o 0 si no tiene
+  if (!d || !d._ts) return 0;
+  return typeof d._ts === 'number' ? d._ts : new Date(d._ts).getTime();
 }
 
-async function syncToCloud() {
-  if (isSaving) return;
-  isSaving = true;
-  setCloud('saving', '💾 Guardando…');
-  const data = { entries, pedidos, stock, lastUpdated: lastUpdated?.toISOString(), lastAdded };
-  const ok = await cloudSave(data);
-  lastRemoteHash = dataHash(data);
-  isSaving = false;
-  if (ok) {
-    setCloud('ok', '☁️ Guardado · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
-  } else {
-    setCloud('error', '❌ Error al guardar');
-  }
+function isEmpty(d) {
+  if (!d) return true;
+  const i = d.entries?.ing?.length || 0;
+  const g = d.entries?.gas?.length || 0;
+  const p = d.pedidos?.length || 0;
+  const s = d.stock?.length   || 0;
+  return i + g + p + s === 0;
 }
 
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(async () => {
-    if (!isSaving) await syncFromCloud();
-  }, POLL_MS);
+function buildPayload() {
+  return {
+    entries, pedidos, stock,
+    lastUpdated: lastUpdated?.toISOString() || null,
+    lastAdded,
+    _ts: Date.now()   // timestamp de escritura — es la clave anti-sobreescritura
+  };
 }
 
-// ── Persistence ───────────────────────────────
+// ── Local backup ─────────────────────────────
+// Guardamos hasta 3 snapshots con timestamp para poder recuperar
 function saveLocal() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify({ entries, pedidos, stock, lastUpdated: lastUpdated?.toISOString(), lastAdded })); } catch(e){}
-}
-
-function save() {
-  saveLocal();
-  syncToCloud();
+  const payload = buildPayload();
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    // Rotar backups: backup_0 es el más reciente, backup_2 el más antiguo
+    const b1 = localStorage.getItem(STORAGE_KEY + '_backup_1');
+    const b0 = localStorage.getItem(STORAGE_KEY + '_backup_0');
+    if (b1) localStorage.setItem(STORAGE_KEY + '_backup_2', b1);
+    if (b0) localStorage.setItem(STORAGE_KEY + '_backup_1', b0);
+    localStorage.setItem(STORAGE_KEY + '_backup_0', JSON.stringify(payload));
+  } catch(e) {}
 }
 
 function loadLocal() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const d = JSON.parse(raw);
-      entries     = d.entries  || { ing:[], gas:[] };
-      pedidos     = d.pedidos  || [];
-      stock       = d.stock    || [];
-      lastUpdated = d.lastUpdated ? new Date(d.lastUpdated) : null;
-      lastAdded   = d.lastAdded   || null;
-      return true;
-    }
-  } catch(e){}
-  return false;
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch(e) { return null; }
+}
+
+function applyData(d) {
+  entries     = d.entries  || { ing:[], gas:[] };
+  pedidos     = d.pedidos  || [];
+  stock       = d.stock    || [];
+  lastUpdated = d.lastUpdated ? new Date(d.lastUpdated) : null;
+  lastAdded   = d.lastAdded   || null;
+}
+
+// ── Sync: subir a la nube ─────────────────────
+async function syncToCloud() {
+  if (isSaving) { saveQueued = true; return; }
+  isSaving = true;
+  setCloud('saving', '💾 Guardando…');
+  const payload = buildPayload();
+  // Guardar backup local ANTES de intentar subir
+  saveLocal();
+  const ok = await cloudSave(payload);
+  isSaving = false;
+  if (ok) {
+    lastRemoteTs = payload._ts;
+    setCloud('ok', '☁️ Guardado · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  } else {
+    setCloud('error', '❌ Error al guardar — datos en local seguros');
+  }
+  // Si hubo una escritura pendiente mientras guardábamos, la procesamos
+  if (saveQueued) { saveQueued = false; syncToCloud(); }
+}
+
+// ── Sync: bajar de la nube (polling) ─────────
+async function syncFromCloud() {
+  if (isSaving) return; // Estamos escribiendo, no leer ahora
+  const remote = await cloudLoad();
+  if (!remote) { setCloud('error', '❌ Sin conexión'); return; }
+
+  const remoteTs = dataTs(remote);
+
+  // Si la nube tiene datos más nuevos que los que conocemos → actualizamos
+  if (remoteTs > lastRemoteTs) {
+    lastRemoteTs = remoteTs;
+    applyData(remote);
+    saveLocal();
+    refreshStatus();
+    renderAll();
+    setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  } else {
+    setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  }
+}
+
+// ── Arranque inicial ─────────────────────────
+// Devuelve true si cargó datos de la nube, false si no
+async function initialSync() {
+  setCloud('loading', '🔄 Conectando…');
+  const remote = await cloudLoad();
+
+  if (!remote) {
+    // Sin conexión: usar local si existe
+    setCloud('error', '❌ Sin conexión — usando datos locales');
+    return false;
+  }
+
+  const remoteTs  = dataTs(remote);
+  const localData = loadLocal();
+  const localTs   = dataTs(localData);
+
+  if (isEmpty(remote) && isEmpty(localData)) {
+    // Ni nube ni local tienen datos → seed inicial (solo ocurre la primera vez)
+    seedFromCSV();
+    setCloud('ok', '☁️ Datos iniciales subidos');
+    return true;
+  }
+
+  if (isEmpty(remote) && !isEmpty(localData)) {
+    // Nube vacía pero local tiene datos → subir local a la nube
+    applyData(localData);
+    await syncToCloud();
+    return true;
+  }
+
+  // La nube tiene datos: comparar timestamps
+  if (remoteTs >= localTs) {
+    // Nube más nueva o igual → usar nube
+    lastRemoteTs = remoteTs;
+    applyData(remote);
+    saveLocal();
+    setCloud('ok', '☁️ Al día · ' + new Date().toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'}));
+  } else {
+    // Local más nuevo (p.ej. cambios sin conexión) → subir local a nube
+    applyData(localData);
+    await syncToCloud();
+  }
+  return true;
+}
+
+function startPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => { if (appReady) syncFromCloud(); }, POLL_MS);
+}
+
+// ── save() — llamado en cada acción del usuario ──
+function save() {
+  if (!appReady) return; // nunca guardar durante la carga inicial
+  saveLocal();
+  syncToCloud();
 }
 
 function seedFromCSV() {
+  // Solo se llama cuando tanto nube como local están vacíos (primera vez)
+  entries = { ing: [], gas: [] };
+  pedidos = []; stock = [];
   let id = 1;
   CSV_SEED.forEach(r => entries[r.type].push({ name: r.name, amt: r.amt, month: r.month, id: id++ }));
   lastUpdated = new Date('2026-04-07T00:00:00');
   lastAdded   = { type: 'ing', name: 'dan suscrpción atw', amt: 40.00 };
-  save();
 }
 
 // ── Helpers ───────────────────────────────────
@@ -961,17 +1037,22 @@ function exportCSV(){
 }
 
 // ── Init ──────────────────────────────────────
-const hasData = loadLocal();
-if (!hasData) seedFromCSV();
+// 1. Mostrar datos locales inmediatamente (pantalla rápida)
+const localSnapshot = loadLocal();
+if (localSnapshot) applyData(localSnapshot);
 document.getElementById('ing-month').value = currentMonth();
 document.getElementById('gas-month').value = currentMonth();
 refreshStatus();
 render();
 setPedFilter('all');
 
-// Carga inicial desde la nube y arranca el polling
-setCloud('loading', '🔄 Conectando…');
-syncFromCloud(true).then(() => startPolling());
+// 2. Sincronizar con la nube (decide quién manda según timestamps)
+initialSync().then(() => {
+  refreshStatus();
+  renderAll();
+  appReady = true;  // a partir de aquí save() puede escribir a la nube
+  startPolling();
+});
 
 document.getElementById('ing-name').addEventListener('keydown',e=>e.key==='Enter'&&document.getElementById('ing-amt').focus());
 document.getElementById('ing-amt').addEventListener('keydown', e=>e.key==='Enter'&&addEntry('ing'));
